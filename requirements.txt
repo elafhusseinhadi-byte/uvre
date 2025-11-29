@@ -1,6 +1,9 @@
 fastapi
 uvicorn
 sqlalchemy
+pydantic
+numpy
+scikit-learn
 requests
 matplotlib
 numpy
