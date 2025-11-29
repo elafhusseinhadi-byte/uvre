@@ -1,20 +1,20 @@
 # =====================================================
-# main.py — AI UAV Server (Single City, Prediction, Avoidance)
+# main.py — Cloud + AI UAV Server (Single City)
 # =====================================================
 
 from fastapi import FastAPI
 from pydantic import BaseModel
-import time, os, math
+import os, time, math, random
 
-# -------------------------
-# SQLAlchemy Setup
-# -------------------------
-from sqlalchemy import (
-    create_engine, Column, Integer, Float, String,
-    MetaData, Table
-)
+from sqlalchemy import create_engine, Column, Integer, Float, String, MetaData, Table
 from sqlalchemy.orm import sessionmaker
 
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+# =====================================================
+# DB Setup (SQLite)
+# =====================================================
 DATABASE_URL = "sqlite:///uav_ai.sqlite"
 
 engine = create_engine(
@@ -34,23 +34,76 @@ uav_table = Table(
     Column("heading", Float),
     Column("vx", Float),
     Column("vy", Float),
-    Column("system_case", String)
+    Column("system_case", String),   # normal / ai_avoid
 )
 
 metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)
 
 # =====================================================
+# AI Risk Model (Logistic Regression) – Synthetic Training
+# =====================================================
+
+def generate_training_data(n=5000):
+    """نولد بيانات صناعية لتعليم نموذج التصادم."""
+    X = []
+    y = []
+    for _ in range(n):
+        d = random.uniform(0.0, 0.10)      # distance (deg)
+        rel_v = random.uniform(0.0, 50.0)  # relative speed
+        alt_diff = random.uniform(0.0, 20.0)
+
+        # قاعدة بسيطة لتوليد الليبل:
+        # قريب جداً + فرق ارتفاع قليل -> غالباً خطر
+        # قريب ومتقابلين بسرعة عالية -> خطر
+        risk = 1 if (d < 0.02 and alt_diff < 5) or (d < 0.03 and rel_v > 20) else 0
+
+        X.append([d, rel_v, alt_diff])
+        y.append(risk)
+
+    return np.array(X), np.array(y)
+
+X_train, y_train = generate_training_data()
+risk_model = LogisticRegression()
+risk_model.fit(X_train, y_train)
+
+# =====================================================
+# Helper Functions (Distance + Prediction + Avoidance)
+# =====================================================
+
+def dist(u1, u2):
+    return math.sqrt((u1.x - u2.x)**2 + (u1.y - u2.y)**2)
+
+def predict_next(u, dt=1.0):
+    return (u.x + u.vx*dt, u.y + u.vy*dt)
+
+def avoidance_B(u):
+    # side shift بسيط
+    u.x += 0.003
+    u.y -= 0.003
+
+def avoidance_C(u):
+    # تغيير ارتفاع بسيط
+    u.altitude += 2.0
+
+def apply_avoidance(u_high, u_other):
+    # نطبّق B على الأولى و C على الثانية
+    avoidance_B(u_high)
+    avoidance_C(u_other)
+    u_high.system_case = "ai_avoid"
+    u_other.system_case = "ai_avoid"
+
+# =====================================================
 # FASTAPI App
 # =====================================================
-app = FastAPI(title="UAV AI Server – Single City")
 
-# Render PORT
+app = FastAPI(title="Cloud+AI UAV Collision Prediction Server")
 PORT = int(os.environ.get("PORT", 10000))
 
 # =====================================================
-# UAV Model
+# Pydantic Model
 # =====================================================
+
 class UAV(BaseModel):
     uav_id: int
     x: float
@@ -60,44 +113,18 @@ class UAV(BaseModel):
     heading: float
     vx: float
     vy: float
-    system_case: str
+    system_case: str = "normal"   # default
 
 # =====================================================
-# Helper Functions (Prediction + Avoidance)
+# PUT /uav — insert/update single UAV
 # =====================================================
 
-def dist(a, b):
-    return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
-
-def predict_next(uav, dt=1.0):
-    return (
-        uav.x + uav.vx * dt,
-        uav.y + uav.vy * dt
-    )
-
-def avoidance_B(uav):
-    uav.x += 0.005
-    uav.y -= 0.005
-
-def avoidance_C(uav):
-    uav.altitude += 2
-
-def apply_avoidance(a, b):
-    avoidance_B(a)
-    avoidance_C(b)
-
-# =====================================================
-# PUT /uav
-# =====================================================
 @app.put("/uav")
 def put_uav(data: UAV):
     session = SessionLocal()
     start = time.time()
-
     try:
-        existing = session.query(uav_table).filter_by(
-            uav_id=data.uav_id
-        ).first()
+        existing = session.query(uav_table).filter_by(uav_id=data.uav_id).first()
 
         values = {
             "x": data.x,
@@ -123,22 +150,20 @@ def put_uav(data: UAV):
             session.execute(stmt)
 
         session.commit()
-
-        latency = (time.time() - start) * 1000
-        return {"status": "ok", "latency_ms": round(latency,3)}
-
+        latency = (time.time() - start)*1000
+        return {"status": "ok", "latency_ms": round(latency, 3)}
     finally:
         session.close()
 
 # =====================================================
-# GET /uavs
+# GET /uavs — all UAVs
 # =====================================================
+
 @app.get("/uavs")
 def get_uavs():
     session = SessionLocal()
     try:
         uavs = session.query(uav_table).all()
-
         return {
             "count": len(uavs),
             "uavs": [
@@ -154,48 +179,66 @@ def get_uavs():
                 for u in uavs
             ]
         }
-
     finally:
         session.close()
 
 # =====================================================
-# POST /process (AI + Avoidance)
+# POST /process — AI Prediction + Avoidance
 # =====================================================
+
 @app.post("/process")
-def process_uavs():
+def process():
     session = SessionLocal()
     start = time.time()
-
     try:
         uavs = session.query(uav_table).all()
         n = len(uavs)
 
+        if n == 0:
+            return {"processed": 0, "collisions": 0, "high_risk": 0, "latency_ms": 0}
+
         collisions = 0
-        warnings = 0
+        high_risk = 0
 
+        # -------- نحسب أقرب جار لكل طائرة + نمرّرها للـ AI ----------
         for i in range(n):
-            for j in range(i+1, n):
-                a = uavs[i]
-                b = uavs[j]
+            ui = uavs[i]
 
-                # current distance
-                d_now = dist(a, b)
+            # ابحث عن أقرب جار
+            nearest = None
+            d_min = 1e9
+            for j in range(n):
+                if i == j:
+                    continue
+                uj = uavs[j]
+                d = dist(ui, uj)
+                if d < d_min:
+                    d_min = d
+                    nearest = uj
 
-                # predicted next-second distance
-                ax2, ay2 = predict_next(a)
-                bx2, by2 = predict_next(b)
-                d_future = math.sqrt((ax2 - bx2)**2 + (ay2 - by2)**2)
+            if nearest is None:
+                continue
 
-                # collision now
-                if d_now < 0.01:
-                    collisions += 1
+            # مسافة حالية
+            d_now = d_min
+            # سرعة نسبية
+            rel_v = math.sqrt((ui.vx - nearest.vx)**2 + (ui.vy - nearest.vy)**2)
+            # فرق ارتفاع
+            alt_diff = abs(ui.altitude - nearest.altitude)
 
-                # danger in the future
-                if d_future < 0.02:
-                    warnings += 1
-                    apply_avoidance(a, b)
+            # Detection rule-based
+            if d_now < 0.01:
+                collisions += 1
 
-        # update database after avoidance
+            # AI risk prediction
+            X_feat = np.array([[d_now, rel_v, alt_diff]])
+            prob = risk_model.predict_proba(X_feat)[0,1]  # احتمال التصادم
+
+            if prob > 0.6:   # threshold
+                high_risk += 1
+                apply_avoidance(ui, nearest)
+
+        # -------- تحديث قاعدة البيانات بعد الـ Avoidance ----------
         for u in uavs:
             stmt = (
                 uav_table.update()
@@ -203,35 +246,36 @@ def process_uavs():
                 .values(
                     x=u.x,
                     y=u.y,
-                    altitude=u.altitude
+                    altitude=u.altitude,
+                    system_case=u.system_case
                 )
             )
             session.execute(stmt)
 
         session.commit()
-
         latency = (time.time() - start)*1000
 
         return {
             "processed": n,
             "collisions": collisions,
-            "future_warnings": warnings,
-            "latency_ms": round(latency,3)
+            "high_risk": high_risk,
+            "latency_ms": round(latency, 3)
         }
-
     finally:
         session.close()
 
 # =====================================================
-# Health
+# Health Check
 # =====================================================
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 # =====================================================
-# Run (Render)
+# Run locally / Render
 # =====================================================
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
