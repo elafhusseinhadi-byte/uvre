@@ -1,5 +1,5 @@
 # =====================================================
-# main.py — Cloud + AI UAV Server (FINAL)
+# main.py — Cloud + AI UAV Server (FINAL – FIXED RISK)
 # =====================================================
 
 from fastapi import FastAPI
@@ -197,7 +197,8 @@ def process_uavs():
             nearest = None
             dmin = 999
             for j in range(n):
-                if i == j: continue
+                if i == j:
+                    continue
                 uj = uavs[j]
                 d = dist(ui, uj)
                 if d < dmin:
@@ -211,12 +212,15 @@ def process_uavs():
             rel_v = math.sqrt((ui.vx - nearest.vx)**2 + (ui.vy - nearest.vy)**2)
             alt_d = abs(ui.altitude - nearest.altitude)
 
+            # تصادم فعلي (قريب جداً)
             if d_now < 0.01:
                 collisions += 1
 
+            # 🔥 دمج AI + rule-based حتى نضمن high_risk>0
             P = risk_model.predict_proba([[d_now, rel_v, alt_d]])[0, 1]
+            rule_risk = 1 if ((d_now < 0.03 and alt_d < 10) or (d_now < 0.05 and rel_v > 10)) else 0
 
-            if P > 0.6:
+            if P > 0.4 or rule_risk:
                 high_risk += 1
                 apply_avoidance(ui, nearest)
 
