@@ -1,7 +1,3 @@
-# =====================================================
-# main.py — Cloud + AI UAV Server (Single City) — FINAL STRONG AVOIDANCE
-# =====================================================
-
 from fastapi import FastAPI
 from pydantic import BaseModel
 import os, time, math, random
@@ -42,17 +38,20 @@ Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)
 
 # =====================================================
-# AI Risk Model (Logistic Regression)
+# AI Risk Model — Logistic Regression
 # =====================================================
 
 def generate_training_data(n=5000):
-    X, y = [], []
+    X = []
+    y = []
+
     for _ in range(n):
         d = random.uniform(0.0, 0.10)
         rel_v = random.uniform(0.0, 50.0)
         alt_diff = random.uniform(0.0, 20.0)
 
         risk = 1 if (d < 0.02 and alt_diff < 5) or (d < 0.03 and rel_v > 20) else 0
+
         X.append([d, rel_v, alt_diff])
         y.append(risk)
 
@@ -69,31 +68,26 @@ risk_model.fit(X_train, y_train)
 def dist(u1, u2):
     return math.sqrt((u1.x - u2.x)**2 + (u1.y - u2.y)**2)
 
-# =====================================================
-# Strong Avoidance Logic
-# =====================================================
 
-def apply_strong_avoidance(u1, u2):
-    """
-    u1 = الطائرة ذات الخطر الأعلى (AI)
-    u2 = الطائرة الثانية الأقرب
-    """
+# *** THE FIX: REAL AVOIDANCE (قوي وواضح بصريًا) ***
+def apply_avoidance(u1, u2):
 
-    # Move u1 (escape)
-    u1.x += random.uniform(0.05, 0.15)
-    u1.y += random.uniform(0.05, 0.15)
-    u1.altitude += random.uniform(8, 15)
+    # الطائرة الأولى تهرب يمين/أعلى
+    u1.x += random.uniform(0.05, 0.12)
+    u1.y += random.uniform(0.05, 0.12)
+    u1.altitude += random.uniform(5, 15)
     u1.vx += random.uniform(0.02, 0.05)
     u1.vy += random.uniform(0.02, 0.05)
     u1.system_case = "ai_avoid"
 
-    # Move u2 (different escape)
-    u2.x -= random.uniform(0.05, 0.15)
-    u2.y -= random.uniform(0.05, 0.15)
-    u2.altitude -= random.uniform(8, 15)
+    # الطائرة الثانية تهرب يسار/أسفل
+    u2.x -= random.uniform(0.05, 0.12)
+    u2.y -= random.uniform(0.05, 0.12)
+    u2.altitude -= random.uniform(5, 15)
     u2.vx -= random.uniform(0.02, 0.05)
     u2.vy -= random.uniform(0.02, 0.05)
     u2.system_case = "ai_avoid"
+
 
 # =====================================================
 # FASTAPI APP
@@ -167,43 +161,44 @@ def get_uavs():
             "uavs": [
                 dict(
                     uav_id=u.uav_id,
-                    x=u.x, y=u.y,
+                    x=u.x,
+                    y=u.y,
                     altitude=u.altitude,
                     speed=u.speed,
                     heading=u.heading,
-                    vx=u.vx, vy=u.vy,
+                    vx=u.vx,
+                    vy=u.vy,
                     system_case=u.system_case
-                )
-                for u in rows
+                ) for u in rows
             ]
         }
     finally:
         session.close()
 
 # =====================================================
-# POST /process — AI Prediction + Strong Avoidance
+# POST /process — AI Prediction + Avoidance
 # =====================================================
 
 @app.post("/process")
 def process_uavs():
     session = SessionLocal()
-    start = time.time()
-
     try:
         uavs = session.query(UAVModel).all()
         n = len(uavs)
+
+        if n == 0:
+            return {"processed": 0}
 
         collisions = 0
         high_risk = 0
 
         for i in range(n):
             ui = uavs[i]
-
-            # Find nearest neighbor
             nearest = None
             d_min = 999
+
             for j in range(n):
-                if i == j:
+                if i == j: 
                     continue
                 uj = uavs[j]
                 d = dist(ui, uj)
@@ -214,36 +209,32 @@ def process_uavs():
             if nearest is None:
                 continue
 
-            # rule-based collision
-            if d_min < 0.01:
+            d_now  = d_min
+            rel_v  = math.sqrt((ui.vx - nearest.vx)**2 + (ui.vy - nearest.vy)**2)
+            alt_d  = abs(ui.altitude - nearest.altitude)
+
+            if d_now < 0.01:
                 collisions += 1
 
-            # AI risk prediction
-            P = risk_model.predict_proba([[d_min,
-                                           math.sqrt((ui.vx - nearest.vx)**2 + (ui.vy - nearest.vy)**2),
-                                           abs(ui.altitude - nearest.altitude)
-                                          ]])[0, 1]
+            P = risk_model.predict_proba([[d_now, rel_v, alt_d]])[0, 1]
 
             if P > 0.6:
                 high_risk += 1
-                apply_strong_avoidance(ui, nearest)
+                apply_avoidance(ui, nearest)
 
         session.commit()
-
-        latency = (time.time() - start) * 1000
 
         return {
             "processed": n,
             "collisions": collisions,
-            "high_risk": high_risk,
-            "latency_ms": round(latency, 3)
+            "high_risk": high_risk
         }
 
     finally:
         session.close()
 
 # =====================================================
-# Health Check
+# Health
 # =====================================================
 
 @app.get("/health")
@@ -251,7 +242,7 @@ def health():
     return {"status": "ok"}
 
 # =====================================================
-# Run locally
+# Run
 # =====================================================
 
 if __name__ == "__main__":
