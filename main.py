@@ -53,9 +53,8 @@ def generate_training_data(n=5000):
         rel_v = random.uniform(0.0, 50.0)  # relative speed
         alt_diff = random.uniform(0.0, 20.0)
 
-        # قاعدة بسيطة لتوليد الليبل:
         # قريب جداً + فرق ارتفاع قليل -> غالباً خطر
-        # قريب ومتقابلين بسرعة عالية -> خطر
+        # أو قريب مع سرعة نسبية عالية -> خطر
         risk = 1 if (d < 0.02 and alt_diff < 5) or (d < 0.03 and rel_v > 20) else 0
 
         X.append([d, rel_v, alt_diff])
@@ -77,19 +76,22 @@ def dist(u1, u2):
 def predict_next(u, dt=1.0):
     return (u.x + u.vx*dt, u.y + u.vy*dt)
 
+# 🔥 تعديل مهم: نخلي المناورة قوية وواضحة
 def avoidance_B(u):
-    # side shift بسيط
-    u.x += 0.003
-    u.y -= 0.003
+    # مناورة جانبية قوية (هروب على X,Y)
+    u.x += random.uniform(0.02, 0.05)
+    u.y += random.uniform(0.02, 0.05)
 
 def avoidance_C(u):
-    # تغيير ارتفاع بسيط
-    u.altitude += 2.0
+    # تغيير ارتفاع ملحوظ
+    u.altitude += random.uniform(5.0, 12.0)
 
 def apply_avoidance(u_high, u_other):
-    # نطبّق B على الأولى و C على الثانية
+    # الطائرة عالية الخطر تتحرك بقوة جانبية
     avoidance_B(u_high)
+    # الثانية تغيّر ارتفاعها
     avoidance_C(u_other)
+
     u_high.system_case = "ai_avoid"
     u_other.system_case = "ai_avoid"
 
@@ -204,7 +206,6 @@ def process():
         for i in range(n):
             ui = uavs[i]
 
-            # ابحث عن أقرب جار
             nearest = None
             d_min = 1e9
             for j in range(n):
@@ -219,22 +220,19 @@ def process():
             if nearest is None:
                 continue
 
-            # مسافة حالية
             d_now = d_min
-            # سرعة نسبية
             rel_v = math.sqrt((ui.vx - nearest.vx)**2 + (ui.vy - nearest.vy)**2)
-            # فرق ارتفاع
             alt_diff = abs(ui.altitude - nearest.altitude)
 
-            # Detection rule-based
+            # Rule-based collisions
             if d_now < 0.01:
                 collisions += 1
 
             # AI risk prediction
             X_feat = np.array([[d_now, rel_v, alt_diff]])
-            prob = risk_model.predict_proba(X_feat)[0,1]  # احتمال التصادم
+            prob = risk_model.predict_proba(X_feat)[0, 1]
 
-            if prob > 0.6:   # threshold
+            if prob > 0.6:
                 high_risk += 1
                 apply_avoidance(ui, nearest)
 
