@@ -1,134 +1,237 @@
+# =====================================================
+# main.py — AI UAV Server (Single City, Prediction, Avoidance)
+# =====================================================
 
-# =====================================================
-# 🚀 UAV Simulation Server (Online Ready)
-# =====================================================
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, Float, String, MetaData, Table
-from sqlalchemy.orm import sessionmaker
-import time, random, asyncio
+import time, os, math
 
-# -------------------------------
-# 🛰️ نموذج بيانات UAV
-# -------------------------------
+# -------------------------
+# SQLAlchemy Setup
+# -------------------------
+from sqlalchemy import (
+    create_engine, Column, Integer, Float, String,
+    MetaData, Table
+)
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = "sqlite:///uav_ai.sqlite"
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False}
+)
+
+metadata = MetaData()
+
+uav_table = Table(
+    "uavs", metadata,
+    Column("uav_id", Integer, primary_key=True),
+    Column("x", Float),
+    Column("y", Float),
+    Column("altitude", Float),
+    Column("speed", Float),
+    Column("heading", Float),
+    Column("vx", Float),
+    Column("vy", Float),
+    Column("system_case", String)
+)
+
+metadata.create_all(engine)
+SessionLocal = sessionmaker(bind=engine)
+
+# =====================================================
+# FASTAPI App
+# =====================================================
+app = FastAPI(title="UAV AI Server – Single City")
+
+# Render PORT
+PORT = int(os.environ.get("PORT", 10000))
+
+# =====================================================
+# UAV Model
+# =====================================================
 class UAV(BaseModel):
     uav_id: int
     x: float
     y: float
     altitude: float
     speed: float
-    system_case: str  # normal, avoidance
+    heading: float
+    vx: float
+    vy: float
+    system_case: str
 
-# -------------------------------
-# ⚙️ إعداد قاعدة بيانات SQLite
-# -------------------------------
-engine = create_engine("sqlite:///uav_db_full.sqlite", connect_args={"check_same_thread": False})
-metadata = MetaData()
+# =====================================================
+# Helper Functions (Prediction + Avoidance)
+# =====================================================
 
-uav_table = Table(
-    "uavs", metadata,
-    Column("uav_id", Integer, primary_key=True),
-    Column("city_name", String, index=True),
-    Column("x", Float),
-    Column("y", Float),
-    Column("altitude", Float),
-    Column("speed", Float),
-    Column("system_case", String)
-)
-metadata.create_all(engine)
-SessionLocal = sessionmaker(bind=engine)
+def dist(a, b):
+    return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
 
-# -------------------------------
-# 🖥️ إعداد FastAPI server
-# -------------------------------
-app = FastAPI(title="UAV Simulation Server (Online)")
+def predict_next(uav, dt=1.0):
+    return (
+        uav.x + uav.vx * dt,
+        uav.y + uav.vy * dt
+    )
 
-@app.put("/city/{city}/uav")
-async def put_uav(city: str, data: UAV):
+def avoidance_B(uav):
+    uav.x += 0.005
+    uav.y -= 0.005
+
+def avoidance_C(uav):
+    uav.altitude += 2
+
+def apply_avoidance(a, b):
+    avoidance_B(a)
+    avoidance_C(b)
+
+# =====================================================
+# PUT /uav
+# =====================================================
+@app.put("/uav")
+def put_uav(data: UAV):
     session = SessionLocal()
     start = time.time()
+
     try:
-        existing = session.query(uav_table).filter_by(city_name=city, uav_id=data.uav_id).first()
+        existing = session.query(uav_table).filter_by(
+            uav_id=data.uav_id
+        ).first()
+
+        values = {
+            "x": data.x,
+            "y": data.y,
+            "altitude": data.altitude,
+            "speed": data.speed,
+            "heading": data.heading,
+            "vx": data.vx,
+            "vy": data.vy,
+            "system_case": data.system_case,
+        }
+
         if existing:
-            stmt = uav_table.update().where(
-                (uav_table.c.city_name==city) & (uav_table.c.uav_id==data.uav_id)
-            ).values(
-                x=data.x, y=data.y,
-                altitude=data.altitude,
-                speed=data.speed,
-                system_case=data.system_case
+            stmt = (
+                uav_table.update()
+                .where(uav_table.c.uav_id == data.uav_id)
+                .values(**values)
             )
             session.execute(stmt)
         else:
-            stmt = uav_table.insert().values(
-                city_name=city,
-                uav_id=data.uav_id,
-                x=data.x,
-                y=data.y,
-                altitude=data.altitude,
-                speed=data.speed,
-                system_case=data.system_case
-            )
+            values["uav_id"] = data.uav_id
+            stmt = uav_table.insert().values(**values)
             session.execute(stmt)
+
         session.commit()
-        elapsed_ms = (time.time()-start)*1000
-        return {"status":"ok", "put_time_ms": round(elapsed_ms,3)}
+
+        latency = (time.time() - start) * 1000
+        return {"status": "ok", "latency_ms": round(latency,3)}
+
     finally:
         session.close()
 
-@app.get("/city/{city}/uavs")
-async def get_uavs(city: str, system_case: str=None):
+# =====================================================
+# GET /uavs
+# =====================================================
+@app.get("/uavs")
+def get_uavs():
     session = SessionLocal()
-    start = time.time()
     try:
-        query = session.query(uav_table).filter_by(city_name=city)
-        if system_case:
-            query = query.filter_by(system_case=system_case)
-        uavs = query.all()
-        elapsed_ms = (time.time()-start)*1000
-        approx_db_kb = round(len(uavs)*0.5,2)
-        return {"uavs":[{"uav_id": u.uav_id, "x": u.x, "y": u.y, "altitude": u.altitude,
-                         "speed": u.speed, "system_case": u.system_case} for u in uavs],
-                "get_time_ms": round(elapsed_ms,3),
-                "db_size_kb": approx_db_kb}
+        uavs = session.query(uav_table).all()
+
+        return {
+            "count": len(uavs),
+            "uavs": [
+                dict(
+                    uav_id=u.uav_id,
+                    x=u.x, y=u.y,
+                    altitude=u.altitude,
+                    speed=u.speed,
+                    heading=u.heading,
+                    vx=u.vx, vy=u.vy,
+                    system_case=u.system_case
+                )
+                for u in uavs
+            ]
+        }
+
     finally:
         session.close()
 
-@app.post("/city/{city}/process")
-async def process_uavs(city: str, system_case: str=None):
+# =====================================================
+# POST /process (AI + Avoidance)
+# =====================================================
+@app.post("/process")
+def process_uavs():
     session = SessionLocal()
     start = time.time()
+
     try:
-        query = session.query(uav_table).filter_by(city_name=city)
-        if system_case:
-            query = query.filter_by(system_case=system_case)
-        uavs = query.all()
+        uavs = session.query(uav_table).all()
         n = len(uavs)
-        collision_pairs = []
 
-        # كشف التصادم (distance < 5)
+        collisions = 0
+        warnings = 0
+
         for i in range(n):
             for j in range(i+1, n):
-                dx = uavs[i].x - uavs[j].x
-                dy = uavs[i].y - uavs[j].y
-                if (dx**2 + dy**2)**0.5 < 5:
-                    collision_pairs.append([uavs[i].uav_id,uavs[j].uav_id])
+                a = uavs[i]
+                b = uavs[j]
 
-        # محاكاة زمن المعالجة
-        await asyncio.sleep(0.001*n)
-        elapsed_ms = (time.time()-start)*1000
-        avg_per_uav = round(elapsed_ms/n,3) if n>0 else 0
-        return {"processed_uavs": n,
-                "post_time_ms": round(elapsed_ms,3),
-                "avg_post_per_uav_ms": avg_per_uav,
-                "collisions_detected": len(collision_pairs),
-                "collision_pairs": collision_pairs}
+                # current distance
+                d_now = dist(a, b)
+
+                # predicted next-second distance
+                ax2, ay2 = predict_next(a)
+                bx2, by2 = predict_next(b)
+                d_future = math.sqrt((ax2 - bx2)**2 + (ay2 - by2)**2)
+
+                # collision now
+                if d_now < 0.01:
+                    collisions += 1
+
+                # danger in the future
+                if d_future < 0.02:
+                    warnings += 1
+                    apply_avoidance(a, b)
+
+        # update database after avoidance
+        for u in uavs:
+            stmt = (
+                uav_table.update()
+                .where(uav_table.c.uav_id == u.uav_id)
+                .values(
+                    x=u.x,
+                    y=u.y,
+                    altitude=u.altitude
+                )
+            )
+            session.execute(stmt)
+
+        session.commit()
+
+        latency = (time.time() - start)*1000
+
+        return {
+            "processed": n,
+            "collisions": collisions,
+            "future_warnings": warnings,
+            "latency_ms": round(latency,3)
+        }
+
     finally:
         session.close()
 
-# -------------------------------
-# 🌍 تشغيل السيرفر (على Render)
-# -------------------------------
+# =====================================================
+# Health
+# =====================================================
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# =====================================================
+# Run (Render)
+# =====================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
