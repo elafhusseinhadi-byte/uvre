@@ -1,5 +1,5 @@
 # =====================================================
-# main.py — Cloud + AI UAV Server (Single City) — ORM VERSION
+# main.py — Cloud + AI UAV Server (Single City) — FINAL STRONG AVOIDANCE
 # =====================================================
 
 from fastapi import FastAPI
@@ -46,15 +46,13 @@ SessionLocal = sessionmaker(bind=engine)
 # =====================================================
 
 def generate_training_data(n=5000):
-    X = []
-    y = []
+    X, y = [], []
     for _ in range(n):
         d = random.uniform(0.0, 0.10)
         rel_v = random.uniform(0.0, 50.0)
         alt_diff = random.uniform(0.0, 20.0)
 
         risk = 1 if (d < 0.02 and alt_diff < 5) or (d < 0.03 and rel_v > 20) else 0
-
         X.append([d, rel_v, alt_diff])
         y.append(risk)
 
@@ -71,19 +69,31 @@ risk_model.fit(X_train, y_train)
 def dist(u1, u2):
     return math.sqrt((u1.x - u2.x)**2 + (u1.y - u2.y)**2)
 
-# 🔥 stronger avoidance
-def avoidance_B(u):
-    u.x += random.uniform(0.02, 0.05)
-    u.y += random.uniform(0.02, 0.05)
+# =====================================================
+# Strong Avoidance Logic
+# =====================================================
 
-def avoidance_C(u):
-    u.altitude += random.uniform(5.0, 12.0)
+def apply_strong_avoidance(u1, u2):
+    """
+    u1 = الطائرة ذات الخطر الأعلى (AI)
+    u2 = الطائرة الثانية الأقرب
+    """
 
-def apply_avoidance(u_high, u_other):
-    avoidance_B(u_high)
-    avoidance_C(u_other)
-    u_high.system_case = "ai_avoid"
-    u_other.system_case = "ai_avoid"
+    # Move u1 (escape)
+    u1.x += random.uniform(0.05, 0.15)
+    u1.y += random.uniform(0.05, 0.15)
+    u1.altitude += random.uniform(8, 15)
+    u1.vx += random.uniform(0.02, 0.05)
+    u1.vy += random.uniform(0.02, 0.05)
+    u1.system_case = "ai_avoid"
+
+    # Move u2 (different escape)
+    u2.x -= random.uniform(0.05, 0.15)
+    u2.y -= random.uniform(0.05, 0.15)
+    u2.altitude -= random.uniform(8, 15)
+    u2.vx -= random.uniform(0.02, 0.05)
+    u2.vy -= random.uniform(0.02, 0.05)
+    u2.system_case = "ai_avoid"
 
 # =====================================================
 # FASTAPI APP
@@ -114,12 +124,10 @@ class UAV(BaseModel):
 @app.put("/uav")
 def put_uav(data: UAV):
     session = SessionLocal()
-    start = time.time()
     try:
         existing = session.query(UAVModel).filter_by(uav_id=data.uav_id).first()
 
         if existing:
-            # update
             existing.x = data.x
             existing.y = data.y
             existing.altitude = data.altitude
@@ -129,7 +137,6 @@ def put_uav(data: UAV):
             existing.vy = data.vy
             existing.system_case = data.system_case
         else:
-            # insert
             obj = UAVModel(
                 uav_id=data.uav_id,
                 x=data.x, y=data.y,
@@ -160,34 +167,31 @@ def get_uavs():
             "uavs": [
                 dict(
                     uav_id=u.uav_id,
-                    x=u.x,
-                    y=u.y,
+                    x=u.x, y=u.y,
                     altitude=u.altitude,
                     speed=u.speed,
                     heading=u.heading,
-                    vx=u.vx,
-                    vy=u.vy,
+                    vx=u.vx, vy=u.vy,
                     system_case=u.system_case
-                ) for u in rows
+                )
+                for u in rows
             ]
         }
     finally:
         session.close()
 
 # =====================================================
-# POST /process — AI Prediction + Avoidance
+# POST /process — AI Prediction + Strong Avoidance
 # =====================================================
 
 @app.post("/process")
 def process_uavs():
     session = SessionLocal()
     start = time.time()
+
     try:
         uavs = session.query(UAVModel).all()
         n = len(uavs)
-
-        if n == 0:
-            return {"processed": 0}
 
         collisions = 0
         high_risk = 0
@@ -195,11 +199,12 @@ def process_uavs():
         for i in range(n):
             ui = uavs[i]
 
-            # nearest neighbor
+            # Find nearest neighbor
             nearest = None
             d_min = 999
             for j in range(n):
-                if i == j: continue
+                if i == j:
+                    continue
                 uj = uavs[j]
                 d = dist(ui, uj)
                 if d < d_min:
@@ -209,25 +214,24 @@ def process_uavs():
             if nearest is None:
                 continue
 
-            d_now = d_min
-            rel_v = math.sqrt((ui.vx - nearest.vx)**2 + (ui.vy - nearest.vy)**2)
-            alt_diff = abs(ui.altitude - nearest.altitude)
-
-            # rule-based
-            if d_now < 0.01:
+            # rule-based collision
+            if d_min < 0.01:
                 collisions += 1
 
-            # AI prediction
-            P = risk_model.predict_proba([[d_now, rel_v, alt_diff]])[0, 1]
+            # AI risk prediction
+            P = risk_model.predict_proba([[d_min,
+                                           math.sqrt((ui.vx - nearest.vx)**2 + (ui.vy - nearest.vy)**2),
+                                           abs(ui.altitude - nearest.altitude)
+                                          ]])[0, 1]
 
             if P > 0.6:
                 high_risk += 1
-                apply_avoidance(ui, nearest)
+                apply_strong_avoidance(ui, nearest)
 
-        # ORM auto-updates
         session.commit()
 
         latency = (time.time() - start) * 1000
+
         return {
             "processed": n,
             "collisions": collisions,
