@@ -1,220 +1,242 @@
-# ============================================================
-# FULL UAV ANALYSIS – BEFORE/AFTER + 3 LATENCY CURVES
-# Server: https://uvre.onrender.com
-# ============================================================
+# =====================================================
+# main.py — Cloud + AI UAV Server (FINAL)
+# =====================================================
 
-import requests
-import random
-import math
-import time
+from fastapi import FastAPI
+from pydantic import BaseModel
+import os, time, math, random
+
+from sqlalchemy import create_engine, Column, Integer, Float, String
+from sqlalchemy.orm import sessionmaker, declarative_base
+
 import numpy as np
-import matplotlib.pyplot as plt
+from sklearn.linear_model import LogisticRegression
 
-BASE = "https://uvre.onrender.com"   # سيرفرك
+# =====================================================
+# DATABASE (SQLite)
+# =====================================================
 
-# ============================================================
-# Helper Functions
-# ============================================================
+DATABASE_URL = "sqlite:///uav_ai.sqlite"
 
-def dist(a, b):
-    return math.sqrt((a["x"] - b["x"])**2 + (a["y"] - b["y"])**2)
+Base = declarative_base()
 
-def classify(uavs, thr_actual=0.01, thr_pred=0.03):
-    """
-    Red     = Actual Collision (قريب جداً)
-    Yellow  = Predicted Collision (خطر متوقع)
-    Blue    = Normal
-    """
-    normal, predicted, actual = [], [], []
+class UAVModel(Base):
+    __tablename__ = "uavs"
 
-    for i in range(len(uavs)):
-        ui = uavs[i]
-        dmin = 999
+    uav_id     = Column(Integer, primary_key=True)
+    x          = Column(Float)
+    y          = Column(Float)
+    altitude   = Column(Float)
+    speed      = Column(Float)
+    heading    = Column(Float)
+    vx         = Column(Float)
+    vy         = Column(Float)
+    system_case = Column(String)
 
-        for j in range(len(uavs)):
-            if i == j:
-                continue
-            uj = uavs[j]
-            d = dist(ui, uj)
-            if d < dmin:
-                dmin = d
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False}
+)
+Base.metadata.create_all(engine)
+SessionLocal = sessionmaker(bind=engine)
 
-        if dmin < thr_actual:
-            actual.append(ui)
-        elif dmin < thr_pred:
-            predicted.append(ui)
+# =====================================================
+# AI MODEL — Logistic Regression
+# =====================================================
+
+def generate_training_data(n=5000):
+    X = []
+    y = []
+    for _ in range(n):
+        d = random.uniform(0, 0.1)
+        rel_v = random.uniform(0, 50)
+        alt_diff = random.uniform(0, 20)
+        risk = 1 if (d < 0.02 and alt_diff < 5) or (d < 0.03 and rel_v > 20) else 0
+        X.append([d, rel_v, alt_diff])
+        y.append(risk)
+    return np.array(X), np.array(y)
+
+X_train, y_train = generate_training_data()
+risk_model = LogisticRegression()
+risk_model.fit(X_train, y_train)
+
+# =====================================================
+# Utility
+# =====================================================
+
+def dist(u1, u2):
+    return math.sqrt((u1.x - u2.x)**2 + (u1.y - u2.y)**2)
+
+# قوي — يغيّر بشكل واضح
+def apply_avoidance(u1, u2):
+    # الأول يهرب يمين/فوق
+    u1.x += random.uniform(0.08, 0.15)
+    u1.y += random.uniform(0.08, 0.15)
+    u1.altitude += random.uniform(8, 18)
+    u1.vx += random.uniform(0.03, 0.07)
+    u1.vy += random.uniform(0.03, 0.07)
+    u1.system_case = "ai_avoid"
+
+    # الثاني يهرب يسار/تحت
+    u2.x -= random.uniform(0.08, 0.15)
+    u2.y -= random.uniform(0.08, 0.15)
+    u2.altitude -= random.uniform(8, 18)
+    u2.vx -= random.uniform(0.03, 0.07)
+    u2.vy -= random.uniform(0.03, 0.07)
+    u2.system_case = "ai_avoid"
+
+# =====================================================
+# FastAPI App
+# =====================================================
+
+app = FastAPI(title="Cloud+AI UAV Server – FINAL")
+PORT = int(os.environ.get("PORT", 10000))
+
+# =====================================================
+# Pydantic Model
+# =====================================================
+
+class UAV(BaseModel):
+    uav_id: int
+    x: float
+    y: float
+    altitude: float
+    speed: float
+    heading: float
+    vx: float
+    vy: float
+    system_case: str = "normal"
+
+# =====================================================
+# API ENDPOINTS
+# =====================================================
+
+# ---------- RESET DATABASE ----------
+@app.post("/reset")
+def reset_db():
+    session = SessionLocal()
+    try:
+        session.query(UAVModel).delete()
+        session.commit()
+        return {"status": "database_cleared"}
+    finally:
+        session.close()
+
+# ---------- PUT /uav ----------
+@app.put("/uav")
+def put_uav(data: UAV):
+    session = SessionLocal()
+    try:
+        u = session.query(UAVModel).filter_by(uav_id=data.uav_id).first()
+        if u:
+            u.x = data.x
+            u.y = data.y
+            u.altitude = data.altitude
+            u.speed = data.speed
+            u.heading = data.heading
+            u.vx = data.vx
+            u.vy = data.vy
+            u.system_case = data.system_case
         else:
-            normal.append(ui)
+            u = UAVModel(
+                uav_id=data.uav_id,
+                x=data.x, y=data.y,
+                altitude=data.altitude,
+                speed=data.speed,
+                heading=data.heading,
+                vx=data.vx, vy=data.vy,
+                system_case=data.system_case
+            )
+            session.add(u)
+        session.commit()
+        return {"status": "ok"}
+    finally:
+        session.close()
 
-    return normal, predicted, actual
-
-def plot_clean(ax, uavs, title):
-    normal, predicted, actual = classify(uavs)
-
-    # Normal
-    ax.scatter(
-        [u["x"] for u in normal],
-        [u["y"] for u in normal],
-        c="blue", s=25, label="Normal"
-    )
-
-    # Predicted (AI)
-    ax.scatter(
-        [u["x"] for u in predicted],
-        [u["y"] for u in predicted],
-        c="yellow", edgecolors="black", s=45, label="Predicted Collision"
-    )
-
-    # Actual collisions
-    ax.scatter(
-        [u["x"] for u in actual],
-        [u["y"] for u in actual],
-        c="red", s=55, label="Actual Collision"
-    )
-
-    ax.set_title(title, fontsize=12)
-    ax.set_xlabel("X Coordinate")
-    ax.set_ylabel("Y Coordinate")
-    ax.grid(True)
-
-# ============================================================
-# Generate Scenario – 100 UAVs
-# ============================================================
-
-def generate_100():
-    print("🔹 Generating 100 UAVs on server ...")
-
-    # 10 خطر حقيقي (مجموعة قريبة)
-    for i in range(10):
-        payload = {
-            "uav_id": i,
-            "x": 33.30 + random.uniform(-0.01, 0.01),
-            "y": 44.40 + random.uniform(-0.01, 0.01),
-            "altitude": random.uniform(90, 95),
-            "speed": random.uniform(20, 60),
-            "heading": random.uniform(0, 360),
-            "vx": random.uniform(-0.03, 0.03),
-            "vy": random.uniform(-0.03, 0.03),
-            "system_case": "normal"
+# ---------- GET /uavs ----------
+@app.get("/uavs")
+def get_uavs():
+    session = SessionLocal()
+    try:
+        rows = session.query(UAVModel).all()
+        return {
+            "count": len(rows),
+            "uavs": [
+                dict(
+                    uav_id=u.uav_id,
+                    x=u.x, y=u.y,
+                    altitude=u.altitude,
+                    speed=u.speed,
+                    heading=u.heading,
+                    vx=u.vx, vy=u.vy,
+                    system_case=u.system_case
+                )
+                for u in rows
+            ]
         }
-        requests.put(f"{BASE}/uav", json=payload)
+    finally:
+        session.close()
 
-    # 90 آمنة منتشرة
-    for i in range(10, 100):
-        payload = {
-            "uav_id": i,
-            "x": 33.30 + random.uniform(-0.4, 0.4),
-            "y": 44.40 + random.uniform(-0.4, 0.4),
-            "altitude": random.uniform(95, 120),
-            "speed": random.uniform(20, 60),
-            "heading": random.uniform(0, 360),
-            "vx": random.uniform(-0.03, 0.03),
-            "vy": random.uniform(-0.03, 0.03),
-            "system_case": "normal"
+# ---------- POST /process ----------
+@app.post("/process")
+def process_uavs():
+    session = SessionLocal()
+    try:
+        uavs = session.query(UAVModel).all()
+        n = len(uavs)
+
+        if n == 0:
+            return {"processed": 0}
+
+        collisions = 0
+        high_risk = 0
+
+        for i in range(n):
+            ui = uavs[i]
+
+            nearest = None
+            dmin = 999
+            for j in range(n):
+                if i == j: continue
+                uj = uavs[j]
+                d = dist(ui, uj)
+                if d < dmin:
+                    dmin = d
+                    nearest = uj
+
+            if nearest is None:
+                continue
+
+            d_now = dmin
+            rel_v = math.sqrt((ui.vx - nearest.vx)**2 + (ui.vy - nearest.vy)**2)
+            alt_d = abs(ui.altitude - nearest.altitude)
+
+            if d_now < 0.01:
+                collisions += 1
+
+            P = risk_model.predict_proba([[d_now, rel_v, alt_d]])[0, 1]
+
+            if P > 0.6:
+                high_risk += 1
+                apply_avoidance(ui, nearest)
+
+        session.commit()
+
+        return {
+            "processed": n,
+            "collisions": collisions,
+            "high_risk": high_risk
         }
-        requests.put(f"{BASE}/uav", json=payload)
 
-# ============================================================
-# Latency Measurements (PUT / GET / POST)
-# ============================================================
+    finally:
+        session.close()
 
-def measure_latency_put(n=50):
-    times = []
-    for _ in range(n):
-        payload = {
-            "uav_id": 9999,
-            "x": 33.3,
-            "y": 44.4,
-            "altitude": 100,
-            "speed": 0,
-            "heading": 0,
-            "vx": 0,
-            "vy": 0,
-            "system_case": "lat_test"
-        }
-        t0 = time.time()
-        requests.put(f"{BASE}/uav", json=payload)
-        times.append(time.time() - t0)
-    return np.array(times)
+# ---------- HEALTH ----------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-def measure_latency_get(n=50):
-    times = []
-    for _ in range(n):
-        t0 = time.time()
-        requests.get(f"{BASE}/uavs")
-        times.append(time.time() - t0)
-    return np.array(times)
-
-def measure_latency_post(n=50):
-    times = []
-    for _ in range(n):
-        t0 = time.time()
-        requests.post(f"{BASE}/process")
-        times.append(time.time() - t0)
-    return np.array(times)
-
-def plot_latency(ax, values, title):
-    mean = values.mean()
-    std  = values.std()
-
-    ax.plot(values, color="green", marker="o")
-    ax.axhline(mean, color="red", linestyle="--", label=f"Mean = {mean:.3f}s")
-    ax.fill_between(
-        range(len(values)),
-        mean - std,
-        mean + std,
-        color="green", alpha=0.15
-    )
-    ax.set_title(title)
-    ax.set_xlabel("Trial #")
-    ax.set_ylabel("Seconds")
-    ax.grid(True)
-    ax.legend()
-
-# ============================================================
-# RUN FULL WORKFLOW
-# ============================================================
-
-def run_all():
-    # 1) توليد السيناريو
-    generate_100()
-
-    # 2) BEFORE
-    before = requests.get(f"{BASE}/uavs").json()["uavs"]
-
-    # 3) AI + Avoidance
-    print("🔹 Running AI /process ...")
-    info = requests.post(f"{BASE}/process").json()
-    print("Process info:", info)
-
-    # 4) AFTER
-    after = requests.get(f"{BASE}/uavs").json()["uavs"]
-
-    # ------------------ BEFORE & AFTER جنب بعض ------------------
-    fig, axs = plt.subplots(1, 2, figsize=(16, 7))
-
-    plot_clean(axs[0], before, "🟦 BEFORE AI Avoidance (100 UAVs)")
-    plot_clean(axs[1], after,  "🟩 AFTER AI Avoidance (100 UAVs)")
-
-    handles, labels = axs[1].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper left")
-    plt.tight_layout()
-    plt.show()
-
-    # ------------------ 3 كيرفات Latency جنب بعض ----------------
-    put_t  = measure_latency_put()
-    get_t  = measure_latency_get()
-    post_t = measure_latency_post()
-
-    fig2, axs2 = plt.subplots(1, 3, figsize=(18, 5))
-    plot_latency(axs2[0], put_t,  "PUT Latency (/uav)")
-    plot_latency(axs2[1], get_t,  "GET Latency (/uavs)")
-    plot_latency(axs2[2], post_t, "POST Latency (/process)")
-    plt.tight_layout()
-    plt.show()
-
-# ============================================================
-# RUN
-# ============================================================
-
-run_all()
+# ---------- RUN ----------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
